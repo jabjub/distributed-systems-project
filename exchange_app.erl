@@ -3,7 +3,7 @@
 
 -export([start/0, start/2, stop/1, cluster_nodes/0]).
 
--record(subscription, {
+-record(subscriptions, {
     client_pid,
     stock,
     threshold
@@ -118,7 +118,7 @@ ensure_session_table() ->
     end.
 
 ensure_subscriptions_table() ->
-    Attrs = record_info(fields, subscription),
+    Attrs = record_info(fields, subscriptions),
     ConnectedCopies = [node() | [Node || Node <- discovered_peers(), Node =/= node(), lists:member(Node, nodes())]],
     TableOpts = [{attributes, Attrs}, {type, bag}, {disc_copies, ConnectedCopies}],
     case mnesia:create_table(subscriptions, TableOpts) of

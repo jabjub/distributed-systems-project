@@ -1,8 +1,8 @@
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
+import org.java_websocket.WebSocket;
+import org.java_websocket.handshake.ClientHandshake;
+import org.java_websocket.server.WebSocketServer;
+
+import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketAddress;
@@ -33,6 +33,9 @@ public class TraderClient {
     private Thread readerThread;
     private Thread heartbeatThread;
 
+    // NEW: The embedded WebSocket Server for the UI
+    private DashboardServer dashboardServer;
+
     public TraderClient(String primaryHost, int primaryPort, String backupHost, int backupPort) {
         this.primaryHost = primaryHost;
         this.primaryPort = primaryPort;
@@ -49,39 +52,79 @@ public class TraderClient {
         int backupPort = args.length > 3 ? Integer.parseInt(args[3]) : 9001;
 
         TraderClient client = new TraderClient(primaryHost, primaryPort, backupHost, backupPort);
+
+        // 1. Start the WebSocket Server for the UI on port 8085
+        client.startWebSocketServer(8085);
+
+        // 2. Connect to the Erlang Backend
         client.connectInitial();
         client.startReaderThread();
         client.startHeartbeatThread();
 
-        // 1. THE STATIC PART: Load default subscriptions automatically
-        System.out.println("Loading default subscriptions...");
-        client.sendCommand("SUB AAPL 151");
-        client.sendCommand("SUB TSLA 205");
-
-        // 2. THE INTERACTIVE PART: Keep the terminal open for new additions
-        Scanner scanner = new Scanner(System.in);
         System.out.println("=========================================");
-        System.out.println(" DEFAULTS LOADED. TERMINAL READY.");
-        System.out.println(" Type more subscriptions (e.g., SUB MSFT 300)");
+        System.out.println(" MIDDLEWARE GATEWAY ONLINE");
+        System.out.println(" 1. Erlang TCP connected on " + client.currentPort);
+        System.out.println(" 2. Web UI listening on ws://localhost:8085");
         System.out.println(" Type 'QUIT' to exit.");
         System.out.println("=========================================");
 
+        Scanner scanner = new Scanner(System.in);
         while (client.running) {
-            // This line keeps the program alive, waiting for your keyboard!
-            String input = scanner.nextLine(); 
-            
+            String input = scanner.nextLine();
             if ("QUIT".equalsIgnoreCase(input.trim())) {
-                System.out.println("Shutting down terminal...");
+                System.out.println("Shutting down gateway...");
                 System.exit(0);
             }
-            
             if (input.trim().length() > 0) {
                 client.sendCommand(input.trim());
-                System.out.println("[SENT] " + input);
             }
         }
         scanner.close();
     }
+
+    // --- NEW: WebSocket Server Logic ---
+    private void startWebSocketServer(int port) {
+        dashboardServer = new DashboardServer(new InetSocketAddress(port));
+        dashboardServer.start();
+    }
+
+    private class DashboardServer extends WebSocketServer {
+        public DashboardServer(InetSocketAddress address) {
+            super(address);
+        }
+
+        @Override
+        public void onOpen(WebSocket conn, ClientHandshake handshake) {
+            System.out.println("[WEB] Browser connected to dashboard.");
+        }
+        
+        @Override
+        public void onClose(WebSocket conn, int code, String reason, boolean remote) {
+            System.out.println("[WEB] Browser disconnected.");
+        }
+
+        @Override
+        public void onMessage(WebSocket conn, String message) {
+            // Forward messages from the browser straight to Erlang
+            try {
+                System.out.println("[WEB -> ERLANG] " + message);
+                sendCommand(message);
+            } catch (IOException e) {
+                conn.send("ERROR: Middleware disconnected from Erlang.");
+            }
+        }
+
+        @Override
+        public void onError(WebSocket conn, Exception ex) {
+            ex.printStackTrace();
+        }
+
+        @Override
+        public void onStart() {
+            System.out.println("[WEB] WebSocket server started successfully.");
+        }
+    }
+    // -----------------------------------
 
     private void connectInitial() {
         System.out.println("Attempting to connect to exchange cluster...");
@@ -89,8 +132,8 @@ public class TraderClient {
     }
 
     private void establishConnectionLocked() {
-        int waitTime = 5000; // Start at 5 seconds
-        final int MAX_WAIT = 60000; // Cap at 60 seconds
+        int waitTime = 5000;
+        final int MAX_WAIT = 60000;
 
         while (running) {
             try {
@@ -107,7 +150,6 @@ public class TraderClient {
                 } catch (IOException backupFailure) {
                     System.out.println("All nodes down. Retrying in " + (waitTime / 1000) + " seconds...");
                     sleepQuietly(waitTime);
-                    // Double the wait time for the next loop, but never exceed MAX_WAIT
                     waitTime = Math.min(waitTime * 2, MAX_WAIT);
                 }
             }
@@ -152,16 +194,20 @@ public class TraderClient {
                 if (line == null) {
                     throw new IOException("socket closed");
                 }
-                
-                // --- THE SILENCER ---
+
                 if ("PONG".equals(line)) {
-                    // Update the heartbeat timer, but DO NOT print anything!
                     lastPongAt = System.currentTimeMillis();
+                } else if (line.startsWith("CLEAR_SUB ")) {
+                    // Remove the fulfilled subscription from the replay cache
+                    String fulfilledCommand = line.substring("CLEAR_SUB ".length()).trim();
+                    sentSubscriptions.remove(fulfilledCommand);
                 } else {
-                    // If it's an ALERT or ACK, print it clearly on a new line
-                    System.out.println("\n[SERVER] " + line);
+                    System.out.println("[ERLANG -> WEB] " + line);
+                    if (dashboardServer != null) {
+                        dashboardServer.broadcast(line);
+                    }
                 }
-                
+
             } catch (IOException readerFailure) {
                 reconnect();
             }
@@ -172,13 +218,8 @@ public class TraderClient {
         while (running) {
             try {
                 sendCommand("PING");
-            } catch (IOException ignored) {
-            }
-
-            // Wait 5 seconds before sending the next PING
+            } catch (IOException ignored) {}
             sleepQuietly(5000);
-
-            // If the server hasn't answered a PING in 10 seconds, THEN we failover
             if (System.currentTimeMillis() - lastPongAt > 10000) {
                 System.out.println("Heartbeat timeout. Server unresponsive during sync.");
                 reconnect();
@@ -225,7 +266,6 @@ public class TraderClient {
                 replaySubscriptionsLocked();
                 System.out.println("Reconnected to " + currentHost + ":" + currentPort);
             } catch (IOException e) {
-                // Catch the exception thrown by replaySubscriptionsLocked()
                 System.err.println("Error during failover data replay: " + e.getMessage());
             } finally {
                 reconnecting = false;
@@ -248,8 +288,6 @@ public class TraderClient {
         reader = null;
         writer = null;
     }
-
-
 
     private static void sleepQuietly(long millis) {
         try {

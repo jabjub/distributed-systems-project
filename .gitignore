@@ -1,9 +1,1 @@
-# Ignore Mnesia databases
-Mnesia.*/
 
-# Ignore compiled Erlang and Java files
-ebin/
-*.class
-
-# Ignore Erlang crash dumps
-erl_crash.dump

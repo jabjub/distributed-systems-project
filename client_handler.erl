@@ -5,7 +5,8 @@
 -record(subscriptions, {
     client_pid,
     stock,
-    threshold
+    threshold,
+    raw_sub
 }).
 
 start(Socket) ->
@@ -40,10 +41,15 @@ handle_message(Socket, ClientPid, Data) ->
         ["SUB", StockStr, PriceStr] ->
             case parse_threshold(PriceStr) of
                 {ok, Threshold} ->
-                    %% USE THE CORRECTED RECORD NAME
-                    Sub = #subscriptions{client_pid = ClientPid, stock = list_to_binary(StockStr), threshold = Threshold},
+                    RawSub = list_to_binary(CommandLine), %% Capture the raw string
+                    Sub = #subscriptions{
+                        client_pid = ClientPid, 
+                        stock = list_to_binary(StockStr), 
+                        threshold = Threshold, 
+                        raw_sub = RawSub  %% Save it to Mnesia
+                    },
                     _ = mnesia:dirty_write(Sub),
-                    ok = gen_tcp:send(Socket, ["ACK SUB ", StockStr, " ", PriceStr, "\n"]);
+                    ok = gen_tcp:send(Socket, ["ACK ", CommandLine, "\n"]);
                 {error, _} ->
                     ok = gen_tcp:send(Socket, "ERR UNKNOWN\n")
             end;

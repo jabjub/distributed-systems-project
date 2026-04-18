@@ -97,7 +97,7 @@ public class TraderClient {
         public void onOpen(WebSocket conn, ClientHandshake handshake) {
             System.out.println("[WEB] Browser connected to dashboard.");
         }
-
+        
         @Override
         public void onClose(WebSocket conn, int code, String reason, boolean remote) {
             System.out.println("[WEB] Browser disconnected.");
@@ -197,9 +197,12 @@ public class TraderClient {
 
                 if ("PONG".equals(line)) {
                     lastPongAt = System.currentTimeMillis();
+                } else if (line.startsWith("CLEAR_SUB ")) {
+                    // Remove the fulfilled subscription from the replay cache
+                    String fulfilledCommand = line.substring("CLEAR_SUB ".length()).trim();
+                    sentSubscriptions.remove(fulfilledCommand);
                 } else {
                     System.out.println("[ERLANG -> WEB] " + line);
-                    // NEW: Broadcast Erlang's message to the Web Dashboard!
                     if (dashboardServer != null) {
                         dashboardServer.broadcast(line);
                     }

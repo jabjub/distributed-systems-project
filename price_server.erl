@@ -81,27 +81,33 @@ cancel_tick(State = #state{tick_ref = Ref}) ->
 
 fluctuate_prices(State = #state{prices = Prices}) ->
     NewPrices = maps:fold(
-        fun(Stock, Price, Acc) ->
+        fun(Stock, OldPrice, Acc) ->
             Delta = random_delta(),
-            NewPrice = round_price(Price * (1.0 + Delta)),
+            NewPrice = round_price(OldPrice * (1.0 + Delta)),
             io:format("[TICKER] ~s shifted to ~s~n", [Stock, format_price(NewPrice)]),
-            deliver_alerts(Stock, NewPrice),
+
+            %% PASS BOTH THE OLD AND NEW PRICE TO THE ALERT SYSTEM
+            deliver_alerts(Stock, OldPrice, NewPrice),
+
             maps:put(Stock, NewPrice, Acc)
         end,
         #{},
         Prices),
     State#state{prices = NewPrices}.
 
-deliver_alerts(Stock, NewPrice) ->
+deliver_alerts(Stock, OldPrice, NewPrice) ->
     Pattern = #subscriptions{client_pid = '_', stock = Stock, threshold = '_'},
     Subs = mnesia:dirty_match_object(subscriptions, Pattern),
     lists:foreach(
-      %% 1. We added "= Record" here to capture the whole database entry
       fun(#subscriptions{client_pid = ClientPid, threshold = Threshold} = Record) ->
-          case NewPrice >= Threshold of
+
+          %% THE FIX: Erlang uses =< instead of <= for "less than or equal to"
+          CrossedUp = (OldPrice < Threshold) andalso (NewPrice >= Threshold),
+          CrossedDown = (OldPrice > Threshold) andalso (NewPrice =< Threshold),
+
+          case CrossedUp orelse CrossedDown of
               true ->
                   send_alert(ClientPid, Stock, NewPrice),
-                  %% 2. THE KILL SWITCH: Delete the rule the exact millisecond it fires
                   mnesia:dirty_delete_object(Record);
               false ->
                   ok

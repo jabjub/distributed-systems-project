@@ -3,11 +3,12 @@
 
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
-
+-export([local_send/4]).
 -record(subscriptions, {
     client_pid,
     stock,
-    threshold
+    threshold,
+    raw_sub
 }).
 
 -record(state, {
@@ -22,19 +23,46 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
-    _ = net_kernel:monitor_nodes(true),
-    _ = seed_rand(),
-    {ok, maybe_activate(#state{})}.
+  _ = net_kernel:monitor_nodes(true),
+  _ = seed_rand(),
 
+  _ = mnesia:wait_for_tables([subscriptions], 5000),
+
+  %% NEW: Ask the cluster if they already have active prices
+  InitialPrices = fetch_existing_prices(),
+
+  %% Boot up using the fetched prices instead of the defaults
+  {ok, maybe_activate(#state{prices = InitialPrices})}.
+
+%% NEW Helper Function: Asks all other active nodes for their prices
+fetch_existing_prices() ->
+  case gen_server:multi_call(nodes(), ?MODULE, get_prices, 2000) of
+    {[{_Node, ActivePrices} | _], _BadNodes} ->
+      ActivePrices; %% Another node is alive! Use their prices.
+    _ ->
+      %% Nobody is alive, use the default starting prices.
+      #{<<"AAPL">> => 150.0, <<"TSLA">> => 200.0, <<"MSFT">> => 300.0}
+  end.
+
+%% Return the current prices if asked
+handle_call(get_prices, _From, State = #state{prices = Prices}) ->
+  {reply, Prices, State};
+
+%% Handle any other generic calls
 handle_call(_Request, _From, State) ->
-    {reply, ok, State}.
+  {reply, ok, State}.
+
+handle_cast({sync_prices, SyncedPrices}, State = #state{active = false}) ->
+    {noreply, State#state{prices = SyncedPrices}};
+
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({nodeup, _Node}, State) ->
     {noreply, maybe_activate(State)};
-handle_info({nodedown, _Node}, State) ->
+handle_info({nodedown, DeadNode}, State) ->
+    cleanup_dead_node(DeadNode),
     {noreply, maybe_activate(State)};
 handle_info(tick, State = #state{active = true}) ->
     UpdatedState = fluctuate_prices(State),
@@ -43,6 +71,18 @@ handle_info(tick, State) ->
     {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
+    
+cleanup_dead_node(DeadNode) ->
+    Pattern = #subscriptions{client_pid = '_', stock = '_', threshold = '_', raw_sub = '_'},
+    Subs = mnesia:dirty_match_object(subscriptions, Pattern),
+    lists:foreach(
+        fun(Sub) ->
+            case node(Sub#subscriptions.client_pid) of
+                DeadNode -> mnesia:dirty_delete_object(Sub);
+                _ -> ok
+            end
+        end,
+        Subs).
 
 terminate(_Reason, State) ->
     cancel_tick(State),
@@ -81,49 +121,60 @@ cancel_tick(State = #state{tick_ref = Ref}) ->
 
 fluctuate_prices(State = #state{prices = Prices}) ->
     NewPrices = maps:fold(
-        fun(Stock, Price, Acc) ->
+        fun(Stock, OldPrice, Acc) ->
             Delta = random_delta(),
-            NewPrice = round_price(Price * (1.0 + Delta)),
+            NewPrice = round_price(OldPrice * (1.0 + Delta)),
             io:format("[TICKER] ~s shifted to ~s~n", [Stock, format_price(NewPrice)]),
-            deliver_alerts(Stock, NewPrice),
+
+            %% PASS BOTH THE OLD AND NEW PRICE TO THE ALERT SYSTEM
+            deliver_alerts(Stock, OldPrice, NewPrice),
+
             maps:put(Stock, NewPrice, Acc)
         end,
         #{},
         Prices),
+    
+    %% NEW: Broadcast the updated prices to all other nodes in the cluster
+    gen_server:abcast(nodes(), ?MODULE, {sync_prices, NewPrices}),
+    
     State#state{prices = NewPrices}.
 
-deliver_alerts(Stock, NewPrice) ->
-    Pattern = #subscriptions{client_pid = '_', stock = Stock, threshold = '_'},
+deliver_alerts(Stock, OldPrice, NewPrice) ->
+    Pattern = #subscriptions{client_pid = '_', stock = Stock, threshold = '_', raw_sub = '_'},
     Subs = mnesia:dirty_match_object(subscriptions, Pattern),
     lists:foreach(
-      %% 1. We added "= Record" here to capture the whole database entry
-      fun(#subscriptions{client_pid = ClientPid, threshold = Threshold} = Record) ->
-          case NewPrice >= Threshold of
-              true ->
-                  send_alert(ClientPid, Stock, NewPrice),
-                  %% 2. THE KILL SWITCH: Delete the rule the exact millisecond it fires
-                  mnesia:dirty_delete_object(Record);
-              false ->
-                  ok
-          end
-      end,
-      Subs),
+        fun(#subscriptions{client_pid = ClientPid, threshold = Threshold, raw_sub = RawSub} = Record) ->
+            CrossedUp = (OldPrice < Threshold) andalso (NewPrice >= Threshold),
+            CrossedDown = (OldPrice > Threshold) andalso (NewPrice =< Threshold),
+            case CrossedUp orelse CrossedDown of
+                true ->
+                    send_alert(ClientPid, Stock, NewPrice, RawSub), %% Pass RawSub here
+                    mnesia:dirty_delete_object(Record);
+                false ->
+                    ok
+            end
+        end,
+        Subs),
     ok.
 
-send_alert(ClientPid, Stock, Price) ->
-    case is_process_alive(ClientPid) of
-        true ->
-            case ets:lookup(client_sessions, ClientPid) of
-                [{ClientPid, Socket}] ->
-                    Message = ["ALERT ", binary_to_list(Stock), " HIT ", format_price(Price), "\n"],
-                    _ = gen_tcp:send(Socket, Message),
-                    ok;
-                [] ->
-                    ok
-            end;
-        false ->
-            ok
-    end.
+local_send(ClientPid, _Stock, Price, RawSub) ->
+  case ets:lookup(client_sessions, ClientPid) of
+    [{ClientPid, Socket}] ->
+      %% Inject the RawSub into the text so the user knows WHICH alert fired
+      Message1 = ["ALERT [", binary_to_list(RawSub), "] fulfilled at ", format_price(Price), "\n"],
+      Message2 = ["CLEAR_SUB ", binary_to_list(RawSub), "\n"],
+      _ = gen_tcp:send(Socket, Message1),
+      _ = gen_tcp:send(Socket, Message2),
+      ok;
+    [] ->
+      ok
+  end.
+
+send_alert(ClientPid, Stock, Price, RawSub) ->
+  %% 1. Find out exactly which node this client's socket lives on
+  ClientNode = node(ClientPid),
+  %% 2. Tell that specific node to execute 'local_send' to push the data to the UI
+  rpc:cast(ClientNode, ?MODULE, local_send, [ClientPid, Stock, Price, RawSub]).
 
 random_delta() ->
     Base = rand:uniform() - 0.5,

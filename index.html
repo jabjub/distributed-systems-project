@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VirtualTrade Dashboard</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f4f9; padding: 20px; color: #333; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 2px solid #ecf0f1; padding-bottom: 10px; }
+        .control-panel { display: flex; gap: 10px; margin-bottom: 20px; }
+        input, button { padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px; }
+        button { background-color: #3498db; color: white; border: none; cursor: pointer; font-weight: bold; }
+        button:hover { background-color: #2980b9; }
+        .logs { background-color: #1e1e1e; color: #00ff00; font-family: monospace; padding: 15px; border-radius: 4px; height: 300px; overflow-y: auto; }
+        .status { margin-bottom: 15px; font-weight: bold; }
+        .status.connected { color: #27ae60; }
+        .status.disconnected { color: #e74c3c; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>📈 VirtualTrade Dashboard</h1>
+    
+    <div id="connectionStatus" class="status disconnected">🔴 Disconnected from Middleware</div>
+
+    <div class="control-panel">
+        <input type="text" id="tickerInput" placeholder="Ticker (e.g., AAPL)" required>
+        <input type="number" id="priceInput" placeholder="Target Price (e.g., 150)" required>
+        <button onclick="sendSubscription()">Subscribe to Alert</button>
+    </div>
+
+    <h3>Live Alerts & System Logs</h3>
+    <div class="logs" id="logBox"></div>
+</div>
+
+<script>
+    // Connect to the Java Middleware (which you will upgrade to host a WebSocket server)
+    const ws = new WebSocket("ws://localhost:8085");
+    const logBox = document.getElementById("logBox");
+    const statusDiv = document.getElementById("connectionStatus");
+
+    ws.onopen = function() {
+        statusDiv.textContent = "🟢 Connected to Middleware";
+        statusDiv.className = "status connected";
+        logMsg("System: WebSocket connection established.");
+    };
+
+    ws.onmessage = function(event) {
+        // When Java sends an ALERT or ACK back to the browser
+        logMsg("Server: " + event.data);
+    };
+
+    ws.onclose = function() {
+        statusDiv.textContent = "🔴 Disconnected from Middleware";
+        statusDiv.className = "status disconnected";
+        logMsg("System: Connection lost.");
+    };
+
+    function sendSubscription() {
+        const ticker = document.getElementById("tickerInput").value.toUpperCase();
+        const price = document.getElementById("priceInput").value;
+        
+        if (ticker && price) {
+            const command = `SUB ${ticker} ${price}`;
+            ws.send(command); // Send to Java Middleware
+            logMsg("You: " + command);
+            
+            // Clear inputs
+            document.getElementById("tickerInput").value = '';
+            document.getElementById("priceInput").value = '';
+        } else {
+            alert("Please enter both a ticker and a target price.");
+        }
+    }
+
+    function logMsg(message) {
+        const p = document.createElement("div");
+        p.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+        logBox.prepend(p); // Add new logs to the top
+    }
+</script>
+
+</body>
+</html>

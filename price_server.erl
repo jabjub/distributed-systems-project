@@ -3,7 +3,7 @@
 
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
-
+-export([local_send/3]).
 -record(subscriptions, {
     client_pid,
     stock,
@@ -117,17 +117,19 @@ deliver_alerts(Stock, OldPrice, NewPrice) ->
     ok.
 
 send_alert(ClientPid, Stock, Price) ->
-    case is_process_alive(ClientPid) of
-        true ->
-            case ets:lookup(client_sessions, ClientPid) of
-                [{ClientPid, Socket}] ->
-                    Message = ["ALERT ", binary_to_list(Stock), " HIT ", format_price(Price), "\n"],
-                    _ = gen_tcp:send(Socket, Message),
-                    ok;
-                [] ->
-                    ok
-            end;
-        false ->
+    %% 1. Find out exactly which node this client's socket lives on
+    ClientNode = node(ClientPid),
+    %% 2. Tell that specific node to execute 'local_send' to push the data to the UI
+    rpc:cast(ClientNode, ?MODULE, local_send, [ClientPid, Stock, Price]).
+
+local_send(ClientPid, Stock, Price) ->
+    %% This runs safely on whichever node actually owns the active connection!
+    case ets:lookup(client_sessions, ClientPid) of
+        [{ClientPid, Socket}] ->
+            Message = ["ALERT ", binary_to_list(Stock), " HIT ", format_price(Price), "\n"],
+            _ = gen_tcp:send(Socket, Message),
+            ok;
+        [] ->
             ok
     end.
 

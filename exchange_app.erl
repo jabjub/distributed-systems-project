@@ -23,9 +23,9 @@ stop(_State) ->
 bootstrap() ->
   ensure_cluster_links(),
 
-  %% 1. Force RAM-only mode by deleting any old ghost disk schemas on boot
+  %% 1. Force RAM-only schema location so Mnesia stays memory-backed.
   _ = mnesia:stop(),
-  _ = mnesia:delete_schema([node()]),
+  ok = application:set_env(mnesia, schema_location, ram),
   ok = mnesia:start(),
 
   %% 2. Network Mnesia with the active cluster dynamically in RAM

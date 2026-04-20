@@ -3,6 +3,8 @@
 
 -export([start/0, start/2, stop/1, cluster_nodes/0]).
 
+-define(DEFAULT_CLUSTER_NODES, "nodeA@10.2.1.3,nodeB@10.2.1.14").
+
 -record(subscriptions, {
   client_pid,
   stock,
@@ -23,9 +25,9 @@ stop(_State) ->
 bootstrap() ->
   ensure_cluster_links(),
 
-  %% 1. Force RAM-only mode by deleting any old ghost disk schemas on boot
+  %% 1. Force RAM-only schema location so Mnesia stays memory-backed.
   _ = mnesia:stop(),
-  _ = mnesia:delete_schema([node()]),
+  ok = application:set_env(mnesia, schema_location, ram),
   ok = mnesia:start(),
 
   %% 2. Network Mnesia with the active cluster dynamically in RAM
@@ -46,15 +48,9 @@ cluster_nodes() ->
 
 discovered_peers() ->
   case os:getenv("STOCK_CLUSTER_NODES") of
-    false -> discover_from_world();
-    "" -> discover_from_world();
+    false -> parse_nodes(?DEFAULT_CLUSTER_NODES);
+    "" -> parse_nodes(?DEFAULT_CLUSTER_NODES);
     NodesStr -> parse_nodes(NodesStr)
-  end.
-
-discover_from_world() ->
-  case net_adm:world() of
-    {ok, Nodes} -> Nodes;
-    {error, _} -> []
   end.
 
 parse_nodes(NodesStr) ->
@@ -79,18 +75,43 @@ ensure_session_table() ->
 
 ensure_subscriptions_table() ->
   Attrs = record_info(fields, subscriptions),
-  Nodes = [node() | nodes()],
+  Nodes = target_cluster_nodes(),
 
-  %% Create table entirely in RAM across all connected nodes
-  _ = mnesia:create_table(subscriptions, [
+  %% Create table in RAM across active-active nodes.
+  CreateRes = mnesia:create_table(subscriptions, [
     {attributes, Attrs},
     {type, bag},
     {ram_copies, Nodes}
   ]),
+  _ = normalize_create_result(CreateRes),
 
-  %% If Node A already made the table, ensure Node B grabs a RAM copy when it joins
-  _ = catch mnesia:add_table_copy(subscriptions, node(), ram_copies),
+  %% Ensure all configured nodes eventually have RAM copies.
+  lists:foreach(
+    fun(TargetNode) ->
+      _ = catch mnesia:add_table_copy(subscriptions, TargetNode, ram_copies),
+      ok
+    end,
+    Nodes
+  ),
 
   %% Wait to ensure the table is ready before the app finishes booting
   _ = mnesia:wait_for_tables([subscriptions], 5000),
+  ok.
+
+target_cluster_nodes() ->
+  Configured = [N || N <- discovered_peers(), node_is_alive(N)],
+  lists:usort([node() | Configured]).
+
+node_is_alive(NodeName) when NodeName =:= node() ->
+  true;
+node_is_alive(NodeName) ->
+  case net_adm:ping(NodeName) of
+    pong -> true;
+    pang -> false
+  end.
+
+normalize_create_result({atomic, ok}) -> ok;
+normalize_create_result({aborted, {already_exists, subscriptions}}) -> ok;
+normalize_create_result({aborted, Reason}) ->
+  io:format("[exchange_app] subscriptions table create returned: ~p~n", [Reason]),
   ok.

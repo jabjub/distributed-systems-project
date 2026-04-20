@@ -1,0 +1,108 @@
+Distributed Stock Price Alert System - Presentation Notes
+
+- Project goal:
+  - Build a fault-tolerant distributed stock alert platform with a Java Middleware Gateway and an Erlang/OTP backend cluster.
+  - Keep browser users connected through WebSockets while backend nodes fail and recover.
+
+- High-level architecture:
+  - Browser Dashboard (index.html):
+    - Sends SUB commands (for example: SUB TSLA 205) over WebSocket.
+    - Displays live logs, alerts, and system status updates.
+  - Java Middleware Gateway (TraderClient.java):
+    - Hosts a WebSocket server for browser clients.
+    - Uses Erlang Jinterface (OtpNode/OtpMbox) to send SUB/command tuples to Erlang nodes.
+    - Implements heartbeat checks, reconnect/failover, and replay of active subscriptions.
+  - Erlang backend cluster (Node A + Node B):
+    - Runs OTP application (exchange_app, exchange_sup, price_server).
+    - Uses Mnesia table subscriptions with ram_copies across cluster nodes.
+    - Leader node drives ticker/price fluctuation and triggers alerts.
+
+- Key data model:
+  - Mnesia record: subscriptions
+    - client_pid: Java mailbox PID to deliver alert message.
+    - stock: stock symbol binary (for example <<"TSLA">>).
+    - threshold: float threshold.
+    - raw_sub: exact original command string (used for replay dedupe and UI message identity).
+
+- Core production issue that was fixed:
+  - Symptom:
+    - During Node A kill test, Java reconnected to Node B and replayed subscriptions, but no alerts fired.
+    - New subscriptions after failover also produced no alerts.
+    - System stayed frozen until full wipe.
+  - Root causes:
+    - Leader activation and node membership could become stale during hard-fail conditions.
+    - Stale Java PID records could coexist and create delivery blackholes after reconnect.
+    - Java receive/heartbeat behavior could trigger reconnect churn and miss alert consumption after failover.
+
+- Erlang fixes implemented (price_server.erl):
+  - Node monitoring hardened:
+    - Added monitor_all_nodes() with node_type all + nodedown_reason (with fallback).
+  - Leader election hardened:
+    - Leader now selected from configured cluster nodes filtered by actual liveness (net_adm:ping/1).
+    - Added configured_cluster_nodes(), parse_cluster_nodes(), node_is_alive(), cluster_nodes(), cluster_peer_nodes().
+  - Activation resilience:
+    - maybe_activate/1 now re-evaluated not only on node up/down events, but also during subscribe and tick paths.
+  - Subscription deduplication by raw command:
+    - Added delete_raw_subscription/1 before each write so replay/new SUB replaces stale entries.
+  - Alert routing simplified:
+    - Alert delivery now sends directly to ClientPid instead of multi-node forward_alert abcast path.
+  - Price sync targeting improved:
+    - Sync broadcasts only to live cluster peers (cluster_peer_nodes()).
+
+- Java fixes implemented (TraderClient.java):
+  - Reader loop reliability:
+    - Switched blocking receive() to receive(1000) polling style to avoid getting stuck on old mailbox paths.
+    - Added safe null handling and reconnect only when running.
+  - Heartbeat stability:
+    - Added HEARTBEAT_FAILURE_THRESHOLD = 3 to avoid reconnect on single transient ping failure.
+    - Reconnect occurs only after consecutive failures.
+  - Replay robustness on reconnect:
+    - Replays subscriptions after reconnect and repeats once after a short delay for startup race resilience.
+  - Dashboard observability:
+    - Added broadcastSystemStatus() to publish middleware status to browser logs.
+    - Browser now receives:
+      - "SYSTEM: Connecting to exchange cluster..."
+      - "SYSTEM: All nodes down. Retrying in X seconds..."
+      - "SYSTEM: Connected to backend node ..."
+
+- Mnesia runtime mode decision:
+  - Requirement:
+    - Keep this project in RAM mode (suitable for failover demo/test and VM deployment scenario without persistence needs).
+  - Changes:
+    - exchange_app.erl sets application env: mnesia schema_location = ram before mnesia:start().
+    - Start scripts now include: -mnesia schema_location ram
+      - start_node_a.bat
+      - start_node_b.bat
+      - start_node_a.sh
+      - start_node_b.sh
+  - Important note:
+    - Old Mnesia.exchange_* folders can remain from previous disk-based runs.
+    - In RAM-only mode they are legacy artifacts and can be removed when nodes are stopped.
+
+- Operational behavior after fixes:
+  - With both nodes up:
+    - Leader ticks prices; subscriptions trigger on threshold crossings up/down.
+  - If leader node is hard-killed:
+    - Java heartbeat detects outage, reconnects to backup node, and replays subscriptions.
+    - Backup node continues processing and alerts still fire.
+  - If both nodes are down:
+    - Java retries with exponential backoff and publishes retry status to dashboard logs.
+  - If nodes return:
+    - Java reconnects and publishes connected status; system resumes without manual wipe.
+
+- Demo flow for presentation:
+  - Start Node A and Node B.
+  - Start TraderClient and open dashboard.
+  - Create multiple TSLA subscriptions around current price.
+  - Show alerts firing.
+  - Hard-kill Node A and show:
+    - reconnect output
+    - replayed subscriptions still triggering on Node B.
+  - Stop both nodes and show dashboard retry status messages.
+  - Bring one node back and show automatic recovery.
+
+- Engineering takeaways:
+  - Distributed failover is not only about state replication; routing identity (PIDs/mailboxes) must also be made failover-safe.
+  - Leader election should use live membership signals and deterministic rules.
+  - Client reconnect loops should be tolerant of transient network failures and avoid single-sample flapping.
+  - Operational transparency (dashboard system logs) is critical for demos and production troubleshooting.

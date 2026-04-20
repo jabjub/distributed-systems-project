@@ -1,16 +1,18 @@
 # Distributed Exchange System (Java + Erlang/OTP)
 
-Active-Active 2-node exchange deployment with:
+2-node active/passive (leader/standby) exchange deployment with failover:
 - **Container 1:** `10.2.1.3` (`nodeA@10.2.1.3`)
 - **Container 2:** `10.2.1.14` (`nodeB@10.2.1.14`)
 
-## Required Versions (Enforced)
+Only the elected leader `price_server` generates price ticks, while the standby node keeps replicated state and takes over on leader failure.
+
+## Runtime/Build Versions (Recommended)
 
 - **Java:** `25.0.1-open`
 - **Maven:** `3.9.11`
 - **Erlang/OTP:** `28`
 
-`pom.xml` now enforces Java and Maven versions at build time.  
+`pom.xml` compiles with Java release 25 (`<release>25</release>`).  
 The project uses the vendored `com.ericsson.otp.erlang` JInterface code aligned with OTP-era 2025 source, matching the Erlang 28 target runtime.
 
 ## Runtime Defaults (No localhost)
@@ -20,7 +22,9 @@ The project uses the vendored `com.ericsson.otp.erlang` JInterface code aligned 
   - `nodeB@10.2.1.14`
 - Java gateway defaults to:
   - `TRADER_BACKEND_NODES=nodeA@10.2.1.3,nodeB@10.2.1.14`
-- Web dashboard defaults to round-robin websocket endpoints:
+- Web dashboard defaults to two websocket endpoints and:
+  - picks the initial endpoint using round-robin
+  - reconnects/fails over across configured endpoints when needed
   - `ws://10.2.1.3:8085`
   - `ws://10.2.1.14:8085`
 
@@ -40,7 +44,7 @@ mvn -DskipTests clean package
 ./start_node_b.sh
 ```
 
-## Active-Active Deployment Automation
+## Active-Passive (Failover) Deployment Automation
 
 Use the deployment script from your local machine:
 

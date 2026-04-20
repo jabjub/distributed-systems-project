@@ -13,10 +13,4 @@ init([]) ->
         shutdown => 5000,
         type => worker,
         modules => [price_server]},
-    TcpListener = #{id => tcp_listener,
-        start => {tcp_listener, start_link, []},
-        restart => permanent,
-        shutdown => 5000,
-        type => worker,
-        modules => [tcp_listener]},
-    {ok, {{one_for_one, 5, 10}, [PriceServer, TcpListener]}}.
+    {ok, {{one_for_one, 5, 10}, [PriceServer]}}.

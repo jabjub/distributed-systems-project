@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-erl -noshell -name setup_mnesia@127.0.0.1 -setcookie stockcookie -eval "
+set -euo pipefail
+
+NODE_A_IP="${NODE_A_IP:-10.2.1.3}"
+NODE_B_IP="${NODE_B_IP:-10.2.1.14}"
+ERLANG_COOKIE="${ERLANG_COOKIE:-exchange_cookie}"
+export STOCK_CLUSTER_NODES="${STOCK_CLUSTER_NODES:-nodeA@${NODE_A_IP},nodeB@${NODE_B_IP}}"
+
+erl -noshell -name "setup_mnesia@${NODE_A_IP}" -setcookie "${ERLANG_COOKIE}" -eval "
 Parse = fun(Str) ->
 	Tokens = string:tokens(Str, \",; \"),
 	lists:filtermap(fun(T) ->
@@ -13,16 +20,8 @@ Parse = fun(Str) ->
 	end, Tokens)
 end,
 Nodes0 = case os:getenv(\"STOCK_CLUSTER_NODES\") of
-	false ->
-		case net_adm:world() of
-			{ok, Ns} -> [node() | Ns];
-			_ -> [node()]
-		end;
-	\"\" ->
-		case net_adm:world() of
-			{ok, Ns} -> [node() | Ns];
-			_ -> [node()]
-		end;
+	false -> [list_to_atom(\"nodeA@10.2.1.3\"), list_to_atom(\"nodeB@10.2.1.14\")];
+	\"\" -> [list_to_atom(\"nodeA@10.2.1.3\"), list_to_atom(\"nodeB@10.2.1.14\")];
 	S -> [node() | Parse(S)]
 end,
 Nodes = lists:usort(Nodes0),

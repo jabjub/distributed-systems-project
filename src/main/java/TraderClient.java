@@ -16,16 +16,22 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Scanner;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class TraderClient {
-    private final String primaryHost;
-    private final int primaryPort;
-    private final String backupHost;
-    private final int backupPort;
+    private static final String DEFAULT_NODE_A = "nodeA@10.2.1.3";
+    private static final String DEFAULT_NODE_B = "nodeB@10.2.1.14";
+    private static final int DEFAULT_NODE_A_PORT = 9000;
+    private static final int DEFAULT_NODE_B_PORT = 9001;
+    private static final int DEFAULT_WS_PORT = 8085;
+    private static final AtomicInteger SESSION_ROUND_ROBIN = new AtomicInteger(0);
+
+    private final List<BackendEndpoint> backendEndpoints;
 
     private final Object connectionLock = new Object();
     private final List<String> sentSubscriptions = Collections.synchronizedList(new ArrayList<>());
@@ -48,25 +54,24 @@ public class TraderClient {
     // NEW: The embedded WebSocket Server for the UI
     private DashboardServer dashboardServer;
 
-    public TraderClient(String primaryHost, int primaryPort, String backupHost, int backupPort) {
-        this.primaryHost = primaryHost;
-        this.primaryPort = primaryPort;
-        this.backupHost = backupHost;
-        this.backupPort = backupPort;
-        this.currentHost = primaryHost;
-        this.currentPort = primaryPort;
+    public TraderClient(List<BackendEndpoint> backendEndpoints) {
+        if (backendEndpoints == null || backendEndpoints.isEmpty()) {
+            throw new IllegalArgumentException("At least one backend endpoint is required.");
+        }
+        this.backendEndpoints = Collections.unmodifiableList(new ArrayList<>(backendEndpoints));
+        this.currentHost = this.backendEndpoints.get(0).remoteNode;
+        this.currentPort = this.backendEndpoints.get(0).port;
     }
 
     public static void main(String[] args) throws Exception {
-        String primaryHost = args.length > 0 ? args[0] : "127.0.0.1";
-        int primaryPort = args.length > 1 ? Integer.parseInt(args[1]) : 9000;
-        String backupHost = args.length > 2 ? args[2] : "127.0.0.1";
-        int backupPort = args.length > 3 ? Integer.parseInt(args[3]) : 9001;
+        List<BackendEndpoint> backends = parseBackends(args);
+        int websocketPort = parseIntEnv("TRADER_WS_PORT", DEFAULT_WS_PORT);
+        String websocketHost = parseStringEnv("TRADER_WS_HOST", "0.0.0.0");
 
-        TraderClient client = new TraderClient(primaryHost, primaryPort, backupHost, backupPort);
+        TraderClient client = new TraderClient(backends);
 
         // 1. Start the WebSocket Server for the UI on port 8085
-        client.startWebSocketServer(8085);
+        client.startWebSocketServer(websocketHost, websocketPort);
 
         // 2. Connect to the Erlang Backend
         client.connectInitial();
@@ -76,12 +81,16 @@ public class TraderClient {
         System.out.println("=========================================");
         System.out.println(" MIDDLEWARE GATEWAY ONLINE");
         System.out.println(" 1. Erlang TCP connected on " + client.currentPort);
-        System.out.println(" 2. Web UI listening on ws://localhost:8085");
+        System.out.println(" 2. Web UI listening on ws://" + websocketHost + ":" + websocketPort);
         System.out.println(" Type 'QUIT' to exit.");
         System.out.println("=========================================");
 
         Scanner scanner = new Scanner(System.in);
         while (client.running) {
+            if (!scanner.hasNextLine()) {
+                sleepQuietly(500);
+                continue;
+            }
             String input = scanner.nextLine();
             if ("QUIT".equalsIgnoreCase(input.trim())) {
                 System.out.println("Shutting down gateway...");
@@ -95,8 +104,8 @@ public class TraderClient {
     }
 
     // --- NEW: WebSocket Server Logic ---
-    private void startWebSocketServer(int port) {
-        dashboardServer = new DashboardServer(new InetSocketAddress(port));
+    private void startWebSocketServer(String host, int port) {
+        dashboardServer = new DashboardServer(new InetSocketAddress(host, port));
         dashboardServer.start();
     }
 
@@ -153,30 +162,33 @@ public class TraderClient {
         final int MAX_WAIT = 60000;
 
         while (running) {
-            try {
-                connectTo(primaryHost, primaryPort);
-                currentPort = primaryPort;
-                return;
-            } catch (IOException primaryFailure) {
+            int startIndex = Math.floorMod(SESSION_ROUND_ROBIN.getAndIncrement(), backendEndpoints.size());
+            IOException lastFailure = null;
+            for (int i = 0; i < backendEndpoints.size(); i++) {
+                BackendEndpoint endpoint = backendEndpoints.get((startIndex + i) % backendEndpoints.size());
                 try {
-                    connectTo(backupHost, backupPort);
-                    currentPort = backupPort;
+                    connectTo(endpoint);
                     return;
-                } catch (IOException backupFailure) {
-                    String retryMsg = "All nodes down. Retrying in " + (waitTime / 1000) + " seconds...";
-                    System.out.println(retryMsg);
-                    broadcastSystemStatus(retryMsg);
-                    sleepQuietly(waitTime);
-                    waitTime = Math.min(waitTime * 2, MAX_WAIT);
+                } catch (IOException connectFailure) {
+                    lastFailure = connectFailure;
                 }
             }
+
+            String retryMsg = "All nodes down. Retrying in " + (waitTime / 1000) + " seconds...";
+            System.out.println(retryMsg);
+            if (lastFailure != null) {
+                System.out.println("Last connection failure: " + lastFailure.getMessage());
+            }
+            broadcastSystemStatus(retryMsg);
+            sleepQuietly(waitTime);
+            waitTime = Math.min(waitTime * 2, MAX_WAIT);
         }
         throw new IOException("gateway stopped");
     }
 
-    private void connectTo(String host, int port) throws IOException {
-        String remoteNode = resolveRemoteNode(host, port);
-        String localNode = buildLocalNodeName(remoteNode);
+    private void connectTo(BackendEndpoint endpoint) throws IOException {
+        String remoteNode = endpoint.remoteNode;
+        String localNode = buildLocalNodeName();
         OtpNode newNode = new OtpNode(localNode, ERLANG_COOKIE);
         OtpMbox newMbox = newNode.createMbox();
 
@@ -189,7 +201,8 @@ public class TraderClient {
             closeCurrentLocked();
             otpNode = newNode;
             mbox = newMbox;
-            currentHost = remoteNode;
+            currentHost = endpoint.remoteNode;
+            currentPort = endpoint.port;
             lastPongAt = System.currentTimeMillis();
         }
         broadcastSystemStatus("Connected to backend node " + remoteNode + ".");
@@ -372,24 +385,26 @@ public class TraderClient {
         if (hostOrNode.contains("@")) {
             return hostOrNode;
         }
-        String host = hostOrNode.trim().isEmpty() ? "127.0.0.1" : hostOrNode.trim();
-        String baseName = port == 9001 ? "exchange_b" : "exchange_a";
+        String host = hostOrNode.trim().isEmpty() ? "10.2.1.3" : hostOrNode.trim();
+        String baseName = port == DEFAULT_NODE_B_PORT ? "nodeB" : "nodeA";
         return baseName + "@" + host;
     }
 
-    private static String buildLocalNodeName(String remoteNode) {
-        String hostPart = "127.0.0.1";
-        int at = remoteNode.indexOf('@');
-        if (at >= 0 && at + 1 < remoteNode.length()) {
-            hostPart = remoteNode.substring(at + 1);
-        } else {
-            try {
-                hostPart = InetAddress.getLocalHost().getHostAddress();
-            } catch (Exception ignored) {
-                hostPart = "127.0.0.1";
-            }
-        }
+    private static String buildLocalNodeName() {
+        String hostPart = resolveLocalNodeHost();
         return "trader_client_" + UUID.randomUUID().toString().replace("-", "") + "@" + hostPart;
+    }
+
+    private static String resolveLocalNodeHost() {
+        String configuredHost = parseStringEnv("TRADER_LOCAL_NODE_HOST", "");
+        if (!configuredHost.isEmpty()) {
+            return configuredHost;
+        }
+        try {
+            return InetAddress.getLocalHost().getHostAddress();
+        } catch (Exception ignored) {
+            return "10.2.1.3";
+        }
     }
 
     private static String otpToString(OtpErlangObject value) throws Exception {
@@ -416,6 +431,122 @@ public class TraderClient {
     private void broadcastSystemStatus(String message) {
         if (dashboardServer != null) {
             dashboardServer.broadcast("SYSTEM: " + message);
+        }
+    }
+
+    private static List<BackendEndpoint> parseBackends(String[] args) {
+        if (args.length >= 4) {
+            BackendEndpoint first = new BackendEndpoint(resolveRemoteNode(args[0], Integer.parseInt(args[1])), Integer.parseInt(args[1]));
+            BackendEndpoint second = new BackendEndpoint(resolveRemoteNode(args[2], Integer.parseInt(args[3])), Integer.parseInt(args[3]));
+            return Arrays.asList(first, second);
+        }
+
+        String configuredNodes = firstNonBlank(
+            args.length > 0 ? args[0] : null,
+            System.getenv("TRADER_BACKEND_NODES"),
+            DEFAULT_NODE_A + "," + DEFAULT_NODE_B
+        );
+
+        List<String> tokens = splitCsv(configuredNodes);
+        List<BackendEndpoint> endpoints = new ArrayList<>();
+        for (int i = 0; i < tokens.size(); i++) {
+            String token = tokens.get(i);
+            int defaultPort = (i % 2 == 0) ? DEFAULT_NODE_A_PORT : DEFAULT_NODE_B_PORT;
+            String fallbackNodeName = (i % 2 == 0) ? "nodeA" : "nodeB";
+            endpoints.add(parseSingleBackend(token, defaultPort, fallbackNodeName));
+        }
+
+        if (endpoints.isEmpty()) {
+            endpoints.add(new BackendEndpoint(DEFAULT_NODE_A, DEFAULT_NODE_A_PORT));
+            endpoints.add(new BackendEndpoint(DEFAULT_NODE_B, DEFAULT_NODE_B_PORT));
+        }
+
+        int startOffset = Math.floorMod(SESSION_ROUND_ROBIN.getAndIncrement(), endpoints.size());
+        List<BackendEndpoint> ordered = new ArrayList<>(endpoints.size());
+        for (int i = 0; i < endpoints.size(); i++) {
+            ordered.add(endpoints.get((startOffset + i) % endpoints.size()));
+        }
+        return ordered;
+    }
+
+    private static BackendEndpoint parseSingleBackend(String raw, int defaultPort, String fallbackNodeName) {
+        String token = raw == null ? "" : raw.trim();
+        if (token.isEmpty()) {
+            String fallbackNode = fallbackNodeName + "@10.2.1.3";
+            return new BackendEndpoint(resolveRemoteNode(fallbackNode, defaultPort), defaultPort);
+        }
+
+        if (token.contains("@")) {
+            return new BackendEndpoint(token, defaultPort);
+        }
+
+        String host = token;
+        int port = defaultPort;
+        int colonIdx = token.lastIndexOf(':');
+        if (colonIdx > 0 && colonIdx < token.length() - 1) {
+            host = token.substring(0, colonIdx).trim();
+            try {
+                port = Integer.parseInt(token.substring(colonIdx + 1).trim());
+            } catch (NumberFormatException ignored) {
+                port = defaultPort;
+            }
+        }
+
+        String remoteNode = resolveRemoteNode(host, port);
+        return new BackendEndpoint(remoteNode, port);
+    }
+
+    private static List<String> splitCsv(String raw) {
+        List<String> result = new ArrayList<>();
+        if (raw == null || raw.trim().isEmpty()) {
+            return result;
+        }
+        String[] tokens = raw.split("[,;\\s]+");
+        for (String token : tokens) {
+            String trimmed = token.trim();
+            if (!trimmed.isEmpty()) {
+                result.add(trimmed);
+            }
+        }
+        return result;
+    }
+
+    private static int parseIntEnv(String key, int fallback) {
+        String raw = System.getenv(key);
+        if (raw == null || raw.trim().isEmpty()) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException ignored) {
+        }
+        return fallback;
+    }
+
+    private static String parseStringEnv(String key, String fallback) {
+        String raw = System.getenv(key);
+        if (raw == null || raw.trim().isEmpty()) {
+            return fallback;
+        }
+        return raw.trim();
+    }
+
+    private static String firstNonBlank(String... candidates) {
+        for (String candidate : candidates) {
+            if (candidate != null && !candidate.trim().isEmpty()) {
+                return candidate.trim();
+            }
+        }
+        return "";
+    }
+
+    private static final class BackendEndpoint {
+        private final String remoteNode;
+        private final int port;
+
+        private BackendEndpoint(String remoteNode, int port) {
+            this.remoteNode = remoteNode;
+            this.port = port;
         }
     }
 }

@@ -3,6 +3,8 @@
 
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+
+-define(DEFAULT_CLUSTER_NODES, "nodeA@10.2.1.3,nodeB@10.2.1.14").
 -record(subscriptions, {
     client_pid,
     stock,
@@ -141,9 +143,11 @@ cluster_peer_nodes() ->
 configured_cluster_nodes() ->
     case os:getenv("STOCK_CLUSTER_NODES") of
         false ->
-            [node() | nodes()];
+            ParsedDefault = parse_cluster_nodes(?DEFAULT_CLUSTER_NODES),
+            lists:usort([node() | ParsedDefault]);
         "" ->
-            [node() | nodes()];
+            ParsedDefault = parse_cluster_nodes(?DEFAULT_CLUSTER_NODES),
+            lists:usort([node() | ParsedDefault]);
         NodesStr ->
             Parsed = parse_cluster_nodes(NodesStr),
             lists:usort([node() | Parsed])
